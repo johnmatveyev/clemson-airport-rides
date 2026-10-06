@@ -72,6 +72,12 @@ Each R00x test covers a specific scenario:
  - Verifies trip status transitions to accepted
  - Validates trip event creation
  - Ensures trip no longer appears in driver desk after acceptance
+**R011**: Driver with non-approved application does not see offers and cannot accept trips
+ - Tests that drivers with non-approved applications (approved: false) see no offers in driver desk
+ - Verifies that approved drivers still see offers normally
+ - Ensures unapproved drivers cannot accept trips even if they are online
+ - Confirms that approved drivers can accept trips and that the trip is removed from all driver desks after acceptance
+ - Validates the approval gate message is informative and correct
 ### Edge Case Tests (`tests/matchingE2E_edgeCases.test.js`)
 
 Additional tests for boundary conditions:
