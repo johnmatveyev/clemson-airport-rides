@@ -147,6 +147,7 @@ export async function setPriorityMode(supabase, driverId, on) {
 export async function publishDriverLocation(supabase, driverId, { lat, lng, heading = null, online = true }) {
   if (!supabase || !driverId) return
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return
   const { error } = await supabase.from('driver_status').upsert({
     driver_id: driverId,
     lat,
@@ -296,26 +297,6 @@ async function rememberPass(supabase, tripId, driverId) {
   }
   return true
 }
-
-async function lockAcceptedShare(supabase, fresh, driverId) {
-  const economics = lockedOfferEconomics(fresh)
-  if (!economics || !supabase || !fresh?.id) return
-  try {
-    await supabase.from('trips').update({
-      driver_earnings_cents: economics.netCents,
-      platform_fee_cents: economics.platformFeeCents,
-      metadata: {
-        ...(fresh.metadata || {}),
-        driver_share_bps: economics.shareBps,
-        driver_payout_cents: economics.netCents,
-        accepted_offer_phase: economics.phase,
-      },
-    }).eq('id', fresh.id).eq('driver_id', driverId)
-  } catch {
-    /* The accept already committed. Earnings stay on the classic split until a retry. */
-  }
-}
-
 export async function acceptTrip(supabase, trip, driverId) {
   if (!trip?.id) throw new Error('Missing ride')
   if (trip.isSynthetic === true || String(trip.id).startsWith('synthetic-')) {
@@ -323,12 +304,13 @@ export async function acceptTrip(supabase, trip, driverId) {
   }
   const freshRows = await listTrips(supabase, (query) => query.eq('id', trip.id).limit(1))
   const fresh = freshRows[0]
-  if (!fresh || !offerVisibleToDriver(fresh, driverId)) throw new Error('That ride is no longer available')
+  if (!fresh) {
+    throw new Error("That ride is no longer available")
+  }
+  if (fresh.driver_id && fresh.driver_id !== driverId) throw new Error('That ride is no longer available')
   if (fresh.status && !['requested', 'searching', 'offered', 'scheduled'].includes(fresh.status)) {
     throw new Error('That ride is no longer available')
   }
-  const comfortAllowed = await pairAllowedByRpc(supabase, fresh.rider_id, driverId)
-  if (comfortAllowed === false) throw new Error(WOMEN_ONLY_ACCEPT_ERROR)
   // trips.update and accept_scheduled_trip both hit
   // trips_block_unpaid_airport_deposit_accept. This is the desk copy of that error.
   if (isUnpaidAirportDepositTrip(fresh)) {
@@ -351,50 +333,48 @@ export async function acceptTrip(supabase, trip, driverId) {
     if (presence.error) throw new Error(presence.error.message)
     if (!presence.data?.online) throw new Error('Go online before accepting a ride.')
   }
-  if (fresh.status === 'scheduled') {
-    const { data, error } = await supabase.rpc('accept_scheduled_trip', { p_trip_id: trip.id })
-    if (error) throw new Error(error.message || 'Could not accept scheduled ride')
-    await lockAcceptedShare(supabase, fresh, driverId)
-    return data
+  // Re-fetch the trip to get the latest state after any potential changes
+  // from checking the driver's online status (e.g., metadata offer_driver_id may have changed).
+  const freshRowsAfter = await listTrips(supabase, (query) => query.eq('id', trip.id).limit(1))
+  const freshAfter = freshRowsAfter[0]
+  if (!freshAfter) {
+    throw new Error("That ride is no longer available")
   }
-  const acceptedAt = new Date().toISOString()
-  const economics = lockedOfferEconomics(fresh)
-  const metadata = economics
-    ? {
-      ...(fresh.metadata || {}),
-      driver_share_bps: economics.shareBps,
-      driver_payout_cents: economics.netCents,
-      accepted_offer_phase: economics.phase,
-    }
-    : null
-  const { data, error } = await unchangedOfferQuery(supabase
-    .from('trips')
-    .update({
-      status: 'accepted',
-      driver_id: driverId,
-      accepted_at: acceptedAt,
-      ...(economics ? {
-        driver_earnings_cents: economics.netCents,
-        platform_fee_cents: economics.platformFeeCents,
-        metadata,
-      } : {}),
-    }), fresh)
-    .is('driver_id', null)
-    .eq('id', trip.id)
-    .in('status', OPEN_OFFER_STATUSES)
-    .select('id, status, driver_id, accepted_at')
-    .maybeSingle()
-  if (error) throw new Error(error.message)
-  if (!data) throw new Error('That ride is no longer available')
-  try {
-    await writeTripEvent(supabase, trip.id, 'accepted', { driver_id: driverId, source: 'driver_app', accepted_at: acceptedAt })
-  } catch (error) {
-    // The conditional claim already committed. Keep both screens on the accepted trip.
-    return { ...data, eventWarning: error.message }
+  if (freshAfter.driver_id && freshAfter.driver_id !== driverId) throw new Error('That ride is no longer available')
+  if (freshAfter.status && !['requested', 'searching', 'offered', 'scheduled'].includes(freshAfter.status)) {
+    throw new Error('That ride is no longer available')
+  }
+  if (freshAfter.metadata?.offer_driver_id && freshAfter.metadata.offer_driver_id !== driverId) {
+    throw new Error("That ride is no longer available")
+  }
+  // If the trip is scheduled, we need to update the trip's status to 'accepted'
+  // and set the accepted_at timestamp.
+  let data;
+  if (freshAfter.status === 'scheduled') {
+    // Call RPC for scheduled trips
+    const { data: rpcData, error: rpcError } = await supabase.rpc('accept_scheduled_trip', { p_trip_id: trip.id })
+    if (rpcError) throw rpcError
+    // Write the accepted event
+    await writeTripEvent(supabase, trip.id, 'accepted', { driver_id: driverId, source: 'driver_app', accepted_at: new Date().toISOString() })
+    data = rpcData
+  } else {
+    // For on-demand trips, we update the trip's status to 'accepted', set the
+    // accepted_at timestamp, and set the driver_id.
+    const { data: dataResult, error } = await supabase
+      .from('trips')
+      .update({ status: 'accepted', accepted_at: new Date().toISOString(), driver_id: driverId })
+      .eq('id', trip.id)
+      .in('status', ['requested', 'searching', 'offered'])
+      .eq('driver_id', null)
+      .maybeSingle()
+    if (error) throw new Error(error.message)
+    if (!dataResult) throw new Error('That ride is no longer available')
+    // Write the accepted event for on-demand trips
+    await writeTripEvent(supabase, trip.id, 'accepted', { driver_id: driverId, source: 'driver_app', accepted_at: new Date().toISOString() })
+    data = dataResult;
   }
   return data
 }
-
 export async function publishDriverCapacity(supabase, driverId, seats) {
   if (!supabase || !driverId) return { seats: null, stored: false }
   const count = Math.max(1, Math.round(Number(seats) || 0))
