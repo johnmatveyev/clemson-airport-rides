@@ -19,7 +19,7 @@ Tests the fundamental matching workflow:
 - Targeted ride protection
 - Terminal status protection
 
-### Dedicated Scenario Tests (R001-R010)
+### Dedicated Scenario Tests (R001-R011)
 
 Each R00x test covers a specific scenario:
 
@@ -113,6 +113,20 @@ The test suite provides comprehensive coverage of:
 - Security/authentication boundaries
 - Performance characteristics (deterministic execution)
 
+
+## Database-Level Guard Coverage
+
+The matching E2E test suite focuses on application-level logic and uses a mock Supabase fixture that does not implement database-level triggers. However, a separate migration (`supabase/migrations/20260925120001_driver_approval_accept_gate.sql`) adds a database-level guard that prevents trip acceptance by drivers whose applications are not approved.
+
+This defense-in-depth layer complements the application-level approval checks tested in the E2E suite (particularly R011). The migration ensures that even if application-level checks were bypassed or misconfigured, the database would still reject trip accepts from non-approved drivers or non-admins.
+
+The guard logic mirrors the application-level approval gate:
+- Admins are always allowed to accept trips.
+- Drivers must have an application row with `onboarding_status = 'approved'` to accept trips.
+- All other application statuses (`pending_review`, `pending_info`, `pending_docs`, `rejected`, or no application row) result in rejection.
+- The error message is consistent: "Finish approval to go online. Your account is still under review."
+
+While the E2E tests do not execute this migration (they use a mock fixture), auditors should verify that the migration SQL is compatible with the tested application behavior and that the error message matches.
 ## Maintenance Notes
 
 - Tests are designed to be deterministic and credential-free
